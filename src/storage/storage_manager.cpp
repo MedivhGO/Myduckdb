@@ -57,7 +57,7 @@ bool ObjectCache::ObjectCacheEnabled(ClientContext &context) {
 }
 
 int64_t StorageManager::GetWALSize() {
-	if (!wal) {
+	if (!wal && !GetWAL()) {
 		return 0;
 	}
 	if (!wal->Initialized()) {
@@ -75,12 +75,20 @@ optional_ptr<WriteAheadLog> StorageManager::GetWAL() {
 		return wal.get();
 	}
 
-	wal = make_uniq<WriteAheadLog>(db, GetWALPath());
+	auto wal_path = GetWALPath();
+	wal = make_uniq<WriteAheadLog>(db, wal_path);
+
+	// If the WAL file exists, then we initialize it.
+	if (FileSystem::Get(db).FileExists(wal_path)) {
+		wal->Initialize();
+	}
 	return wal.get();
 }
 
 void StorageManager::ResetWAL() {
-	wal->Delete();
+	if (wal) {
+		wal->Delete();
+	}
 	wal.reset();
 }
 
@@ -101,14 +109,14 @@ bool StorageManager::InMemory() {
 	return path == IN_MEMORY_PATH;
 }
 
-void StorageManager::Initialize(optional_ptr<ClientContext> context) {
+void StorageManager::Initialize() {
 	bool in_memory = InMemory();
 	if (in_memory && read_only) {
 		throw CatalogException("Cannot launch in-memory database in read-only mode!");
 	}
 
 	// create or load the database from disk, if not in-memory mode
-	LoadDatabase(context);
+	LoadDatabase();
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -135,7 +143,7 @@ SingleFileStorageManager::SingleFileStorageManager(AttachedDatabase &db, string 
     : StorageManager(db, std::move(path), read_only) {
 }
 
-void SingleFileStorageManager::LoadDatabase(optional_ptr<ClientContext> context) {
+void SingleFileStorageManager::LoadDatabase() {
 	if (InMemory()) {
 		block_manager = make_uniq<InMemoryBlockManager>(BufferManager::GetBufferManager(db));
 		table_io_manager = make_uniq<SingleFileTableIOManager>(*block_manager);
@@ -185,7 +193,7 @@ void SingleFileStorageManager::LoadDatabase(optional_ptr<ClientContext> context)
 
 		// load the db from storage
 		auto checkpoint_reader = SingleFileCheckpointReader(*this);
-		checkpoint_reader.LoadFromStorage(context);
+		checkpoint_reader.LoadFromStorage();
 
 		// check if the WAL file exists
 		auto wal_path = GetWALPath();
