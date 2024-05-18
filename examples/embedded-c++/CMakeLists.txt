@@ -4,7 +4,8 @@ project(example-c++)
 set(CMAKE_CXX_STANDARD 11)
 
 include_directories(../../src/include)
-link_directories(../../build/release/src)
+link_directories(../../build/debug/src)
 
+add_definitions("-Wall -g")
 add_executable(example main.cpp)
 target_link_libraries(example duckdb)
