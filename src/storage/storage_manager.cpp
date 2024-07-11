@@ -140,10 +140,6 @@ SingleFileStorageManager::SingleFileStorageManager(AttachedDatabase &db, string 
 
 void SingleFileStorageManager::LoadDatabase(const optional_idx block_alloc_size) {
 	if (InMemory()) {
-		// NOTE: this becomes DEFAULT_BLOCK_ALLOC_SIZE once we start supporting different block sizes.
-		if (block_alloc_size.IsValid() && block_alloc_size.GetIndex() != Storage::BLOCK_ALLOC_SIZE) {
-			throw InternalException("in-memory databases must have the compiled block allocation size");
-		}
 		block_manager = make_uniq<InMemoryBlockManager>(BufferManager::GetBufferManager(db), DEFAULT_BLOCK_ALLOC_SIZE);
 		table_io_manager = make_uniq<SingleFileTableIOManager>(*block_manager);
 		return;
@@ -202,6 +198,12 @@ void SingleFileStorageManager::LoadDatabase(const optional_idx block_alloc_size)
 		sf_block_manager->LoadExistingDatabase();
 		block_manager = std::move(sf_block_manager);
 		table_io_manager = make_uniq<SingleFileTableIOManager>(*block_manager);
+
+		if (block_alloc_size.IsValid() && block_alloc_size.GetIndex() != block_manager->GetBlockAllocSize()) {
+			throw InvalidInputException(
+			    "block size parameter does not match the file's block size, got %llu, expected %llu",
+			    block_alloc_size.GetIndex(), block_manager->GetBlockAllocSize());
+		}
 
 		// load the db from storage
 		auto checkpoint_reader = SingleFileCheckpointReader(*this);
@@ -319,7 +321,7 @@ DatabaseSize SingleFileStorageManager::GetDatabaseSize() {
 	DatabaseSize ds;
 	if (!InMemory()) {
 		ds.total_blocks = block_manager->TotalBlocks();
-		ds.block_size = Storage::BLOCK_ALLOC_SIZE;
+		ds.block_size = block_manager->GetBlockAllocSize();
 		ds.free_blocks = block_manager->FreeBlocks();
 		ds.used_blocks = ds.total_blocks - ds.free_blocks;
 		ds.bytes = (ds.total_blocks * ds.block_size);
