@@ -132,8 +132,18 @@ struct ParquetFileReaderData {
 };
 
 struct ParquetReadGlobalState : public GlobalTableFunctionState {
+	explicit ParquetReadGlobalState(MultiFileList &file_list_p) : file_list(file_list_p) {
+	}
+	explicit ParquetReadGlobalState(unique_ptr<MultiFileList> owned_file_list_p)
+	    : file_list(*owned_file_list_p), owned_file_list(std::move(owned_file_list_p)) {
+	}
+
+	//! The file list to scan
+	MultiFileList &file_list;
 	//! The scan over the file_list
 	MultiFileListScanData file_list_scan;
+	//! Owned multi file list - if filters have been dynamically pushed into the reader
+	unique_ptr<MultiFileList> owned_file_list;
 
 	unique_ptr<MultiFileReaderGlobalState> multi_file_reader_state;
 
@@ -156,7 +166,7 @@ struct ParquetReadGlobalState : public GlobalTableFunctionState {
 	vector<idx_t> projection_ids;
 	vector<LogicalType> scanned_types;
 	vector<column_t> column_ids;
-	TableFilterSet *filters;
+	optional_ptr<TableFilterSet> filters;
 
 	idx_t MaxThreads() const override {
 		return max_threads;
@@ -180,6 +190,7 @@ struct ParquetWriteBindData : public TableFunctionData {
 
 	//! How/Whether to encrypt the data
 	shared_ptr<ParquetEncryptionConfig> encryption_config;
+	bool debug_use_openssl = true;
 
 	//! Dictionary compression is applied only if the compression ratio exceeds this threshold
 	double dictionary_compression_ratio_threshold = 1.0;
@@ -219,6 +230,7 @@ BindInfo ParquetGetBindInfo(const optional_ptr<FunctionData> bind_data) {
 	bind_info.InsertOption("file_path", Value::LIST(LogicalType::VARCHAR, file_path));
 	bind_info.InsertOption("binary_as_string", Value::BOOLEAN(parquet_bind.parquet_options.binary_as_string));
 	bind_info.InsertOption("file_row_number", Value::BOOLEAN(parquet_bind.parquet_options.file_row_number));
+	bind_info.InsertOption("debug_use_openssl", Value::BOOLEAN(parquet_bind.parquet_options.debug_use_openssl));
 	parquet_bind.parquet_options.file_options.AddBatchInfo(bind_info);
 	// LCOV_EXCL_STOP
 	return bind_info;
@@ -381,6 +393,7 @@ public:
 		table_function.table_scan_progress = ParquetProgress;
 		table_function.named_parameters["binary_as_string"] = LogicalType::BOOLEAN;
 		table_function.named_parameters["file_row_number"] = LogicalType::BOOLEAN;
+		table_function.named_parameters["debug_use_openssl"] = LogicalType::BOOLEAN;
 		table_function.named_parameters["compression"] = LogicalType::VARCHAR;
 		table_function.named_parameters["schema"] =
 		    LogicalType::MAP(LogicalType::INTEGER, LogicalType::STRUCT({{{"name", LogicalType::VARCHAR},
@@ -417,6 +430,8 @@ public:
 				parquet_options.binary_as_string = GetBooleanArgument(option);
 			} else if (loption == "file_row_number") {
 				parquet_options.file_row_number = GetBooleanArgument(option);
+			} else if (loption == "debug_use_openssl") {
+				parquet_options.debug_use_openssl = GetBooleanArgument(option);
 			} else if (loption == "encryption_config") {
 				if (option.second.size() != 1) {
 					throw BinderException("Parquet encryption_config cannot be empty!");
@@ -583,6 +598,8 @@ public:
 				parquet_options.binary_as_string = BooleanValue::Get(kv.second);
 			} else if (loption == "file_row_number") {
 				parquet_options.file_row_number = BooleanValue::Get(kv.second);
+			} else if (loption == "debug_use_openssl") {
+				parquet_options.debug_use_openssl = BooleanValue::Get(kv.second);
 			} else if (loption == "schema") {
 				// Argument is a map that defines the schema
 				const auto &schema_value = kv.second;
@@ -613,7 +630,7 @@ public:
 		auto &bind_data = bind_data_p->Cast<ParquetReadBindData>();
 		auto &gstate = global_state->Cast<ParquetReadGlobalState>();
 
-		auto total_count = bind_data.file_list->GetTotalFileCount();
+		auto total_count = gstate.file_list.GetTotalFileCount();
 		if (total_count == 0) {
 			return 100.0;
 		}
@@ -643,16 +660,37 @@ public:
 		return std::move(result);
 	}
 
+	static unique_ptr<MultiFileList> ParquetDynamicFilterPushdown(ClientContext &context,
+	                                                              const ParquetReadBindData &data,
+	                                                              const vector<column_t> &column_ids,
+	                                                              optional_ptr<TableFilterSet> filters) {
+		if (!filters) {
+			return nullptr;
+		}
+		auto new_list = data.multi_file_reader->DynamicFilterPushdown(
+		    context, *data.file_list, data.parquet_options.file_options, data.names, data.types, column_ids, *filters);
+		return new_list;
+	}
+
 	static unique_ptr<GlobalTableFunctionState> ParquetScanInitGlobal(ClientContext &context,
 	                                                                  TableFunctionInitInput &input) {
 		auto &bind_data = input.bind_data->CastNoConst<ParquetReadBindData>();
-		auto result = make_uniq<ParquetReadGlobalState>();
-		bind_data.file_list->InitializeScan(result->file_list_scan);
+		unique_ptr<ParquetReadGlobalState> result;
+
+		// before instantiating a scan trigger a dynamic filter pushdown if possible
+		auto new_list = ParquetDynamicFilterPushdown(context, bind_data, input.column_ids, input.filters);
+		if (new_list) {
+			result = make_uniq<ParquetReadGlobalState>(std::move(new_list));
+		} else {
+			result = make_uniq<ParquetReadGlobalState>(*bind_data.file_list);
+		}
+		auto &file_list = result->file_list;
+		file_list.InitializeScan(result->file_list_scan);
 
 		result->multi_file_reader_state = bind_data.multi_file_reader->InitializeGlobalState(
-		    context, bind_data.parquet_options.file_options, bind_data.reader_bind, *bind_data.file_list,
-		    bind_data.types, bind_data.names, input.column_ids);
-		if (bind_data.file_list->IsEmpty()) {
+		    context, bind_data.parquet_options.file_options, bind_data.reader_bind, file_list, bind_data.types,
+		    bind_data.names, input.column_ids);
+		if (file_list.IsEmpty()) {
 			result->readers = {};
 		} else if (!bind_data.union_readers.empty()) {
 			// TODO: confirm we are not changing behaviour by modifying the order here?
@@ -662,26 +700,24 @@ public:
 				}
 				result->readers.push_back(make_uniq<ParquetFileReaderData>(std::move(reader)));
 			}
-			if (result->readers.size() != bind_data.file_list->GetTotalFileCount()) {
+			if (result->readers.size() != file_list.GetTotalFileCount()) {
 				// This case happens with recursive CTEs: the first execution the readers have already
 				// been moved out of the bind data.
 				// FIXME: clean up this process and make it more explicit
 				result->readers = {};
 			}
 		} else if (bind_data.initial_reader) {
-			// Ensure the initial reader was actually constructed from the first file
-			if (bind_data.initial_reader->file_name != bind_data.file_list->GetFirstFile()) {
-				throw InternalException("First file from list ('%s') does not match first reader ('%s')",
-				                        bind_data.initial_reader->file_name, bind_data.file_list->GetFirstFile());
+			// we can only use the initial reader if it was constructed from the first file
+			if (bind_data.initial_reader->file_name == file_list.GetFirstFile()) {
+				result->readers.push_back(make_uniq<ParquetFileReaderData>(std::move(bind_data.initial_reader)));
 			}
-			result->readers.push_back(make_uniq<ParquetFileReaderData>(std::move(bind_data.initial_reader)));
 		}
 
 		// Ensure all readers are initialized and FileListScan is sync with readers list
 		for (auto &reader_data : result->readers) {
 			string file_name;
 			idx_t file_idx = result->file_list_scan.current_file_idx;
-			bind_data.file_list->Scan(result->file_list_scan, file_name);
+			file_list.Scan(result->file_list_scan, file_name);
 			if (reader_data->union_data) {
 				if (file_name != reader_data->union_data->GetFileName()) {
 					throw InternalException("Mismatch in filename order and union reader order in parquet scan");
@@ -829,9 +865,9 @@ public:
 
 	// Queries the metadataprovider for another file to scan, updating the files/reader lists in the process.
 	// Returns true if resized
-	static bool ResizeFiles(const ParquetReadBindData &bind_data, ParquetReadGlobalState &parallel_state) {
+	static bool ResizeFiles(ParquetReadGlobalState &parallel_state) {
 		string scanned_file;
-		if (!bind_data.file_list->Scan(parallel_state.file_list_scan, scanned_file)) {
+		if (!parallel_state.file_list.Scan(parallel_state.file_list_scan, scanned_file)) {
 			return false;
 		}
 
@@ -852,7 +888,7 @@ public:
 				return false;
 			}
 
-			if (parallel_state.file_index >= parallel_state.readers.size() && !ResizeFiles(bind_data, parallel_state)) {
+			if (parallel_state.file_index >= parallel_state.readers.size() && !ResizeFiles(parallel_state)) {
 				return false;
 			}
 
@@ -895,8 +931,9 @@ public:
 	                                         vector<unique_ptr<Expression>> &filters) {
 		auto &data = bind_data_p->Cast<ParquetReadBindData>();
 
+		MultiFilePushdownInfo info(get);
 		auto new_list = data.multi_file_reader->ComplexFilterPushdown(context, *data.file_list,
-		                                                              data.parquet_options.file_options, get, filters);
+		                                                              data.parquet_options.file_options, info, filters);
 
 		if (new_list) {
 			data.file_list = std::move(new_list);
@@ -938,7 +975,7 @@ public:
 
 		for (idx_t i = parallel_state.file_index; i < file_index_limit; i++) {
 			// We check if we can resize files in this loop too otherwise we will only ever open 1 file ahead
-			if (i >= parallel_state.readers.size() && !ResizeFiles(bind_data, parallel_state)) {
+			if (i >= parallel_state.readers.size() && !ResizeFiles(parallel_state)) {
 				return false;
 			}
 
@@ -1223,6 +1260,15 @@ unique_ptr<FunctionData> ParquetWriteBind(ClientContext &context, CopyFunctionBi
 				                      "dictionary compression");
 			}
 			bind_data->dictionary_compression_ratio_threshold = val;
+		} else if (loption == "debug_use_openssl") {
+			auto val = StringUtil::Lower(option.second[0].GetValue<std::string>());
+			if (val == "false") {
+				bind_data->debug_use_openssl = false;
+			} else if (val == "true") {
+				bind_data->debug_use_openssl = true;
+			} else {
+				throw BinderException("Expected debug_use_openssl to be a BOOLEAN");
+			}
 		} else if (loption == "compression_level") {
 			bind_data->compression_level = option.second[0].GetValue<uint64_t>();
 		} else {
@@ -1250,10 +1296,11 @@ unique_ptr<GlobalFunctionData> ParquetWriteInitializeGlobal(ClientContext &conte
 	auto &parquet_bind = bind_data.Cast<ParquetWriteBindData>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
-	global_state->writer = make_uniq<ParquetWriter>(
-	    context, fs, file_path, parquet_bind.sql_types, parquet_bind.column_names, parquet_bind.codec,
-	    parquet_bind.field_ids.Copy(), parquet_bind.kv_metadata, parquet_bind.encryption_config,
-	    parquet_bind.dictionary_compression_ratio_threshold, parquet_bind.compression_level);
+	global_state->writer =
+	    make_uniq<ParquetWriter>(context, fs, file_path, parquet_bind.sql_types, parquet_bind.column_names,
+	                             parquet_bind.codec, parquet_bind.field_ids.Copy(), parquet_bind.kv_metadata,
+	                             parquet_bind.encryption_config, parquet_bind.dictionary_compression_ratio_threshold,
+	                             parquet_bind.compression_level, parquet_bind.debug_use_openssl);
 	return std::move(global_state);
 }
 
@@ -1376,6 +1423,7 @@ static void ParquetCopySerialize(Serializer &serializer, const FunctionData &bin
 	                         bind_data.dictionary_compression_ratio_threshold);
 	serializer.WritePropertyWithDefault<optional_idx>(109, "compression_level", bind_data.compression_level);
 	serializer.WriteProperty(110, "row_groups_per_file", bind_data.row_groups_per_file);
+	serializer.WriteProperty(111, "debug_use_openssl", bind_data.debug_use_openssl);
 }
 
 static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserializer, CopyFunction &function) {
@@ -1394,6 +1442,7 @@ static unique_ptr<FunctionData> ParquetCopyDeserialize(Deserializer &deserialize
 	deserializer.ReadPropertyWithDefault<optional_idx>(109, "compression_level", data->compression_level);
 	data->row_groups_per_file =
 	    deserializer.ReadPropertyWithDefault<optional_idx>(110, "row_groups_per_file", optional_idx::Invalid());
+	data->debug_use_openssl = deserializer.ReadPropertyWithDefault<bool>(111, "debug_use_openssl", true);
 	return std::move(data);
 }
 // LCOV_EXCL_STOP
@@ -1471,7 +1520,7 @@ bool ParquetWriteRotateNextFile(GlobalFunctionData &gstate, FunctionData &bind_d
 //===--------------------------------------------------------------------===//
 unique_ptr<TableRef> ParquetScanReplacement(ClientContext &context, ReplacementScanInput &input,
                                             optional_ptr<ReplacementScanData> data) {
-	auto &table_name = input.table_name;
+	auto table_name = ReplacementScan::GetFullPath(input);
 	if (!ReplacementScan::CanReplace(table_name, {"parquet"})) {
 		return nullptr;
 	}
