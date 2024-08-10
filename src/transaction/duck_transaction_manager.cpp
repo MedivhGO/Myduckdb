@@ -23,10 +23,14 @@ DuckTransactionManager::DuckTransactionManager(AttachedDatabase &db) : Transacti
 	// transaction ID starts very high:
 	// it should be much higher than the current start timestamp
 	// if transaction_id < start_timestamp for any set of active transactions
-	// uncommited data could be read by
+	// uncommitted data could be read by
 	current_transaction_id = TRANSACTION_ID_START;
 	lowest_active_id = TRANSACTION_ID_START;
 	lowest_active_start = MAX_TRANSACTION_ID;
+	if (!db.GetCatalog().IsDuckCatalog()) {
+		// Specifically the StorageManager of the DuckCatalog is relied on, with `db.GetStorageManager`
+		throw InternalException("DuckTransactionManager should only be created together with a DuckCatalog");
+	}
 }
 
 DuckTransactionManager::~DuckTransactionManager() {
@@ -280,7 +284,7 @@ ErrorData DuckTransactionManager::CommitTransaction(ClientContext &context, Tran
 		tlock.unlock();
 		// checkpoint the database to disk
 		CheckpointOptions options;
-		options.action = CheckpointAction::FORCE_CHECKPOINT;
+		options.action = CheckpointAction::ALWAYS_CHECKPOINT;
 		options.type = checkpoint_decision.type;
 		auto &storage_manager = db.GetStorageManager();
 		storage_manager.CreateCheckpoint(options);
@@ -342,7 +346,7 @@ void DuckTransactionManager::RemoveTransaction(DuckTransaction &transaction, boo
 			old_transactions.push_back(std::move(current_transaction));
 		}
 	} else if (transaction.ChangesMade()) {
-		transaction.Cleanup();
+		transaction.Cleanup(lowest_start_time);
 	}
 	// remove the transaction from the set of currently active transactions
 	active_transactions.unsafe_erase_at(t_index);
@@ -364,7 +368,7 @@ void DuckTransactionManager::RemoveTransaction(DuckTransaction &transaction, boo
 			// we can only safely do the actual memory cleanup when all the
 			// currently active queries have finished running! (actually,
 			// when all the currently active scans have finished running...)
-			recently_committed_transactions[i]->Cleanup();
+			recently_committed_transactions[i]->Cleanup(lowest_start_time);
 			// store the current highest active query
 			recently_committed_transactions[i]->highest_active_query = current_query;
 			// move it to the list of transactions awaiting GC

@@ -1,9 +1,11 @@
 add_library_unity(
   test_sql_capi
   OBJECT
+  capi_aggregate_functions.cpp
   capi_scalar_functions.cpp
   capi_table_functions.cpp
   test_capi.cpp
+  test_capi_any_invalid_type.cpp
   test_starting_database.cpp
   test_capi_appender.cpp
   test_capi_arrow.cpp

@@ -1171,7 +1171,8 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
                              const py::object &date_format, const py::object &timestamp_format,
                              const py::object &quoting, const py::object &encoding, const py::object &compression,
                              const py::object &overwrite, const py::object &per_thread_output,
-                             const py::object &use_tmp_file, const py::object &partition_by) {
+                             const py::object &use_tmp_file, const py::object &partition_by,
+                             const py::object &write_partition_columns) {
 	case_insensitive_map_t<vector<Value>> options;
 
 	if (!py::none().is(sep)) {
@@ -1298,6 +1299,13 @@ void DuckDBPyRelation::ToCSV(const string &filename, const py::object &sep, cons
 		options["partition_by"] = {partition_by_values};
 	}
 
+	if (!py::none().is(write_partition_columns)) {
+		if (!py::isinstance<py::bool_>(write_partition_columns)) {
+			throw InvalidInputException("to_csv only accepts 'write_partition_columns' as a boolean");
+		}
+		options["write_partition_columns"] = {Value::BOOLEAN(py::bool_(write_partition_columns))};
+	}
+
 	auto write_csv = rel->WriteCSVRel(filename, std::move(options));
 	PyExecuteRelation(write_csv);
 }
@@ -1331,8 +1339,8 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Query(const string &view_name, co
 	auto &statement = *parser.statements[0];
 	if (statement.type == StatementType::SELECT_STATEMENT) {
 		auto select_statement = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
-		auto query_relation =
-		    make_shared_ptr<QueryRelation>(rel->context.GetContext(), std::move(select_statement), "query_relation");
+		auto query_relation = make_shared_ptr<QueryRelation>(rel->context.GetContext(), std::move(select_statement),
+		                                                     sql_query, "query_relation");
 		return make_uniq<DuckDBPyRelation>(std::move(query_relation));
 	} else if (IsDescribeStatement(statement)) {
 		auto query = PragmaShow(view_name);

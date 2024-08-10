@@ -126,6 +126,8 @@ enum class ExceptionFormatValueType : uint8_t;
 
 enum class ExceptionType : uint8_t;
 
+enum class ExplainFormat : uint8_t;
+
 enum class ExplainOutputType : uint8_t;
 
 enum class ExplainType : uint8_t;
@@ -135,6 +137,8 @@ enum class ExponentType : uint8_t;
 enum class ExpressionClass : uint8_t;
 
 enum class ExpressionType : uint8_t;
+
+enum class ExtensionABIType : uint8_t;
 
 enum class ExtensionInstallMode : uint8_t;
 
@@ -193,6 +197,8 @@ enum class MacroType : uint8_t;
 enum class MapInvalidReason : uint8_t;
 
 enum class MemoryTag : uint8_t;
+
+enum class MetaPipelineType : uint8_t;
 
 enum class MetricsType : uint8_t;
 
@@ -493,6 +499,9 @@ template<>
 const char* EnumUtil::ToChars<ExceptionType>(ExceptionType value);
 
 template<>
+const char* EnumUtil::ToChars<ExplainFormat>(ExplainFormat value);
+
+template<>
 const char* EnumUtil::ToChars<ExplainOutputType>(ExplainOutputType value);
 
 template<>
@@ -506,6 +515,9 @@ const char* EnumUtil::ToChars<ExpressionClass>(ExpressionClass value);
 
 template<>
 const char* EnumUtil::ToChars<ExpressionType>(ExpressionType value);
+
+template<>
+const char* EnumUtil::ToChars<ExtensionABIType>(ExtensionABIType value);
 
 template<>
 const char* EnumUtil::ToChars<ExtensionInstallMode>(ExtensionInstallMode value);
@@ -593,6 +605,9 @@ const char* EnumUtil::ToChars<MapInvalidReason>(MapInvalidReason value);
 
 template<>
 const char* EnumUtil::ToChars<MemoryTag>(MemoryTag value);
+
+template<>
+const char* EnumUtil::ToChars<MetaPipelineType>(MetaPipelineType value);
 
 template<>
 const char* EnumUtil::ToChars<MetricsType>(MetricsType value);
@@ -971,6 +986,9 @@ template<>
 ExceptionType EnumUtil::FromString<ExceptionType>(const char *value);
 
 template<>
+ExplainFormat EnumUtil::FromString<ExplainFormat>(const char *value);
+
+template<>
 ExplainOutputType EnumUtil::FromString<ExplainOutputType>(const char *value);
 
 template<>
@@ -984,6 +1002,9 @@ ExpressionClass EnumUtil::FromString<ExpressionClass>(const char *value);
 
 template<>
 ExpressionType EnumUtil::FromString<ExpressionType>(const char *value);
+
+template<>
+ExtensionABIType EnumUtil::FromString<ExtensionABIType>(const char *value);
 
 template<>
 ExtensionInstallMode EnumUtil::FromString<ExtensionInstallMode>(const char *value);
@@ -1071,6 +1092,9 @@ MapInvalidReason EnumUtil::FromString<MapInvalidReason>(const char *value);
 
 template<>
 MemoryTag EnumUtil::FromString<MemoryTag>(const char *value);
+
+template<>
+MetaPipelineType EnumUtil::FromString<MetaPipelineType>(const char *value);
 
 template<>
 MetricsType EnumUtil::FromString<MetricsType>(const char *value);
