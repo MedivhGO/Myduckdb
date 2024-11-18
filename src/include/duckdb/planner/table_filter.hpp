@@ -15,6 +15,7 @@
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/unordered_map.hpp"
 #include "duckdb/planner/column_binding.hpp"
+#include "duckdb/common/column_index.hpp"
 
 namespace duckdb {
 class BaseStatistics;
@@ -28,7 +29,8 @@ enum class TableFilterType : uint8_t {
 	IS_NOT_NULL = 2,
 	CONJUNCTION_OR = 3,
 	CONJUNCTION_AND = 4,
-	STRUCT_EXTRACT = 5
+	STRUCT_EXTRACT = 5,
+	OPTIONAL_FILTER = 6
 };
 
 //! TableFilter represents a filter pushed down into the table scan.
@@ -45,6 +47,7 @@ public:
 	//! Returns true if the statistics indicate that the segment can contain values that satisfy that filter
 	virtual FilterPropagateResult CheckStatistics(BaseStatistics &stats) = 0;
 	virtual string ToString(const string &column_name) = 0;
+	string DebugToString();
 	virtual unique_ptr<TableFilter> Copy() const = 0;
 	virtual bool Equals(const TableFilter &other) const {
 		return filter_type != other.filter_type;
@@ -77,7 +80,7 @@ public:
 	unordered_map<idx_t, unique_ptr<TableFilter>> filters;
 
 public:
-	void PushFilter(idx_t column_index, unique_ptr<TableFilter> filter);
+	void PushFilter(const ColumnIndex &col_idx, unique_ptr<TableFilter> filter);
 
 	bool Equals(TableFilterSet &other) {
 		if (filters.size() != other.filters.size()) {
