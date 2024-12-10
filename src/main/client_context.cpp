@@ -936,7 +936,7 @@ unique_ptr<QueryResult> ClientContext::Query(const string &query, bool allow_str
 	}
 
 	unique_ptr<QueryResult> result;
-	QueryResult *last_result = nullptr;
+	optional_ptr<QueryResult> last_result;
 	bool last_had_result = false;
 	for (idx_t i = 0; i < statements.size(); i++) {
 		auto &statement = statements[i];
@@ -971,6 +971,7 @@ unique_ptr<QueryResult> ClientContext::Query(const string &query, bool allow_str
 			// Reset the interrupted flag, this was set by the task that found the error
 			// Next statements should not be bothered by that interruption
 			interrupted = false;
+			break;
 		}
 	}
 	return result;
@@ -1165,7 +1166,9 @@ unique_ptr<TableDescription> ClientContext::TableInfo(const string &schema_name,
 	return TableInfo(INVALID_CATALOG, schema_name, table_name);
 }
 
-void ClientContext::Append(TableDescription &description, ColumnDataCollection &collection) {
+void ClientContext::Append(TableDescription &description, ColumnDataCollection &collection,
+                           optional_ptr<const vector<LogicalIndex>> column_ids) {
+
 	RunFunctionInTransaction([&]() {
 		auto &table_entry =
 		    Catalog::GetEntry<TableCatalogEntry>(*this, description.database, description.schema, description.table);
@@ -1187,7 +1190,7 @@ void ClientContext::Append(TableDescription &description, ColumnDataCollection &
 		auto binder = Binder::CreateBinder(*this);
 		auto bound_constraints = binder->BindConstraints(table_entry);
 		MetaTransaction::Get(*this).ModifyDatabase(table_entry.ParentCatalog().GetAttached());
-		table_entry.GetStorage().LocalAppend(table_entry, *this, collection, bound_constraints);
+		table_entry.GetStorage().LocalAppend(table_entry, *this, collection, bound_constraints, column_ids);
 	});
 }
 

@@ -68,11 +68,52 @@ class TestSparkFunctionsArray:
             Row(max_value=2),
         ]
 
+    def test_get(self, spark):
+        df = spark.createDataFrame([(["a", "b", "c"], 1)], ['data', 'index'])
+
+        res = df.select(F.get(df.data, 1).alias("r")).collect()
+        assert res == [Row(r="b")]
+
+        res = df.select(F.get(df.data, -1).alias("r")).collect()
+        assert res == [Row(r=None)]
+
+        res = df.select(F.get(df.data, 3).alias("r")).collect()
+        assert res == [Row(r=None)]
+
+        res = df.select(F.get(df.data, "index").alias("r")).collect()
+        assert res == [Row(r='b')]
+
+        res = df.select(F.get(df.data, F.col("index") - 1).alias("r")).collect()
+        assert res == [Row(r='a')]
+
+    def test_flatten(self, spark):
+        df = spark.createDataFrame([([[1, 2, 3], [4, 5], [6]],), ([None, [4, 5]],)], ['data'])
+
+        res = df.select(F.flatten(df.data).alias("r")).collect()
+        assert res == [Row(r=[1, 2, 3, 4, 5, 6]), Row(r=None)]
+
+    def test_array_compact(self, spark):
+        df = spark.createDataFrame([([1, None, 2, 3],), ([4, 5, None, 4],)], ['data'])
+
+        res = df.select(F.array_compact(df.data).alias("v")).collect()
+        assert [Row(v=[1, 2, 3]), Row(v=[4, 5, 4])]
+
+    def test_array_remove(self, spark):
+        df = spark.createDataFrame([([1, 2, 3, 1, 1],), ([],)], ['data'])
+
+        res = df.select(F.array_remove(df.data, 1).alias("v")).collect()
+        assert res == [Row(v=[2, 3]), Row(v=[])]
+
     def test_array_agg(self, spark):
         df = spark.createDataFrame([[1, "A"], [1, "A"], [2, "A"]], ["c", "group"])
 
         res = df.groupBy("group").agg(F.array_agg("c").alias("r")).collect()
+        assert res[0] == Row(group="A", r=[1, 1, 2])
 
+    def test_collect_list(self, spark):
+        df = spark.createDataFrame([[1, "A"], [1, "A"], [2, "A"]], ["c", "group"])
+
+        res = df.groupBy("group").agg(F.collect_list("c").alias("r")).collect()
         assert res[0] == Row(group="A", r=[1, 1, 2])
 
     def test_array_append(self, spark):
@@ -111,11 +152,26 @@ class TestSparkFunctionsArray:
             Row(data=['hello', None, 'c', 'b', 'a']),
         ]
 
-    def test_array_join(self, spark):
+    def test_slice(self, spark):
+        df = spark.createDataFrame([([1, 2, 3],), ([4, 5],)], ['x'])
+        res = df.select(F.slice(df.x, 2, 2).alias("sliced")).collect()
+        assert res == [Row(sliced=[2, 3]), Row(sliced=[5])]
+
+    def test_sort_array(self, spark):
+        df = spark.createDataFrame([([2, 1, None, 3],), ([1],), ([],)], ['data'])
+
+        res = df.select(F.sort_array(df.data).alias('r')).collect()
+        assert res == [Row(r=[None, 1, 2, 3]), Row(r=[1]), Row(r=[])]
+
+        res = df.select(F.sort_array(df.data, asc=False).alias('r')).collect()
+        assert res == [Row(r=[3, 2, 1, None]), Row(r=[1]), Row(r=[])]
+
+    @pytest.mark.parametrize(("null_replacement", "expected_joined_2"), [(None, "a"), ("replaced", "a,replaced")])
+    def test_array_join(self, spark, null_replacement, expected_joined_2):
         df = spark.createDataFrame([(["a", "b", "c"],), (["a", None],)], ['data'])
 
-        res = df.select(F.array_join(df.data, ",").alias("joined")).collect()
-        assert res == [Row(joined='a,b,c'), Row(joined='a')]
+        res = df.select(F.array_join(df.data, ",", null_replacement=null_replacement).alias("joined")).collect()
+        assert res == [Row(joined='a,b,c'), Row(joined=expected_joined_2)]
 
     def test_array_position(self, spark):
         df = spark.createDataFrame([(["c", "b", "a"],), ([],)], ['data'])
