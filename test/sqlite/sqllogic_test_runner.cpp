@@ -49,7 +49,8 @@ SQLLogicTestRunner::~SQLLogicTestRunner() {
 
 void SQLLogicTestRunner::ExecuteCommand(duckdb::unique_ptr<Command> command) {
 	if (InLoop()) {
-		active_loops.back()->loop_commands.push_back(std::move(command));
+		auto &current_loop = *active_loops.back();
+		current_loop.loop_commands.push_back(std::move(command));
 	} else {
 		ExecuteContext context;
 		command->Execute(context);
@@ -60,7 +61,8 @@ void SQLLogicTestRunner::StartLoop(LoopDefinition definition) {
 	auto loop = make_uniq<LoopCommand>(*this, std::move(definition));
 	auto loop_ptr = loop.get();
 	if (InLoop()) {
-		active_loops.back()->loop_commands.push_back(std::move(loop));
+		auto &current_loop = *active_loops.back();
+		current_loop.loop_commands.push_back(std::move(loop));
 	} else {
 		// not in a loop yet: new top-level loop
 		top_level_loop = std::move(loop);
@@ -326,6 +328,14 @@ RequireResult SQLLogicTestRunner::CheckRequire(SQLLogicParser &parser, const vec
 	// require command
 	string param = StringUtil::Lower(params[0]);
 	// os specific stuff
+
+	if (param == "notmusl") {
+#ifdef __MUSL_ENABLED__
+		return RequireResult::MISSING;
+#else
+		return RequireResult::PRESENT;
+#endif
+	}
 	if (param == "notmingw") {
 #ifdef __MINGW32__
 		return RequireResult::MISSING;
@@ -407,6 +417,22 @@ RequireResult SQLLogicTestRunner::CheckRequire(SQLLogicParser &parser, const vec
 			return RequireResult::MISSING;
 		}
 		if (limit.GetIndex() < required_limit) {
+			return RequireResult::MISSING;
+		}
+		return RequireResult::PRESENT;
+	}
+
+	if (param == "disk_space") {
+		if (params.size() != 2) {
+			parser.Fail("require disk_space requires a parameter");
+		}
+		// require a minimum amount of disk space
+		auto required_limit = DBConfig::ParseMemoryLimit(params[1]);
+		auto available_space = FileSystem::GetAvailableDiskSpace(".");
+		if (!available_space.IsValid()) {
+			return RequireResult::MISSING;
+		}
+		if (available_space.GetIndex() < required_limit) {
 			return RequireResult::MISSING;
 		}
 		return RequireResult::PRESENT;
