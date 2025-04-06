@@ -3,7 +3,6 @@
 #include "reader/boolean_column_reader.hpp"
 #include "brotli/decode.h"
 #include "reader/callback_column_reader.hpp"
-#include "reader/cast_column_reader.hpp"
 #include "reader/decimal_column_reader.hpp"
 #include "duckdb.hpp"
 #include "reader/expression_column_reader.hpp"
@@ -14,18 +13,20 @@
 #include "reader/null_column_reader.hpp"
 #include "parquet_reader.hpp"
 #include "parquet_timestamp.hpp"
+#include "parquet_float16.hpp"
+
 #include "reader/row_number_column_reader.hpp"
 #include "snappy.h"
 #include "reader/string_column_reader.hpp"
 #include "reader/struct_column_reader.hpp"
 #include "reader/templated_column_reader.hpp"
 #include "reader/uuid_column_reader.hpp"
+
 #include "zstd.h"
 
-#ifndef DUCKDB_AMALGAMATION
+#include "duckdb/storage/table/column_segment.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/common/types/bit.hpp"
-#endif
 
 namespace duckdb {
 
@@ -105,12 +106,10 @@ const uint64_t ParquetDecodeUtils::BITPACK_MASKS_SIZE = sizeof(ParquetDecodeUtil
 
 const uint8_t ParquetDecodeUtils::BITPACK_DLEN = 8;
 
-ColumnReader::ColumnReader(ParquetReader &reader, LogicalType type_p, const SchemaElement &schema_p, idx_t file_idx_p,
-                           idx_t max_define_p, idx_t max_repeat_p)
-    : schema(schema_p), file_idx(file_idx_p), max_define(max_define_p), max_repeat(max_repeat_p), reader(reader),
-      type(std::move(type_p)), page_rows_available(0), dictionary_decoder(*this), delta_binary_packed_decoder(*this),
-      rle_decoder(*this), delta_length_byte_array_decoder(*this), delta_byte_array_decoder(*this),
-      byte_stream_split_decoder(*this) {
+ColumnReader::ColumnReader(ParquetReader &reader, const ParquetColumnSchema &schema_p)
+    : column_schema(schema_p), reader(reader), page_rows_available(0), dictionary_decoder(*this),
+      delta_binary_packed_decoder(*this), rle_decoder(*this), delta_length_byte_array_decoder(*this),
+      delta_byte_array_decoder(*this), byte_stream_split_decoder(*this) {
 }
 
 ColumnReader::~ColumnReader() {
@@ -124,39 +123,15 @@ ParquetReader &ColumnReader::Reader() {
 	return reader;
 }
 
-const LogicalType &ColumnReader::Type() const {
-	return type;
-}
-
-const SchemaElement &ColumnReader::Schema() const {
-	return schema;
-}
-
-optional_ptr<const SchemaElement> ColumnReader::GetParentSchema() const {
-	return parent_schema;
-}
-
-void ColumnReader::SetParentSchema(const SchemaElement &parent_schema_p) {
-	parent_schema = &parent_schema_p;
-}
-
-idx_t ColumnReader::FileIdx() const {
-	return file_idx;
-}
-
-idx_t ColumnReader::MaxDefine() const {
-	return max_define;
-}
-
-idx_t ColumnReader::MaxRepeat() const {
-	return max_repeat;
-}
-
 void ColumnReader::RegisterPrefetch(ThriftFileTransport &transport, bool allow_merge) {
 	if (chunk) {
 		uint64_t size = chunk->meta_data.total_compressed_size;
 		transport.RegisterPrefetch(FileOffset(), size, allow_merge);
 	}
+}
+
+unique_ptr<BaseStatistics> ColumnReader::Stats(idx_t row_group_idx_p, const vector<ColumnChunk> &columns) {
+	return Schema().Stats(reader, row_group_idx_p, columns);
 }
 
 uint64_t ColumnReader::TotalCompressedSize() {
@@ -190,10 +165,6 @@ idx_t ColumnReader::GroupRowsAvailable() {
 	return group_rows_available;
 }
 
-unique_ptr<BaseStatistics> ColumnReader::Stats(idx_t row_group_idx_p, const vector<ColumnChunk> &columns) {
-	return ParquetStatisticsUtils::TransformColumnStatistics(*this, columns);
-}
-
 void ColumnReader::PlainSkip(ByteBuffer &plain_data, uint8_t *defines, idx_t num_values) {
 	throw NotImplementedException("PlainSkip not implemented");
 }
@@ -208,9 +179,14 @@ void ColumnReader::Plain(shared_ptr<ResizeableBuffer> &plain_data, uint8_t *defi
 	Plain(*plain_data, defines, num_values, result_offset, result);
 }
 
+void ColumnReader::PlainSelect(shared_ptr<ResizeableBuffer> &plain_data, uint8_t *defines, idx_t num_values,
+                               Vector &result, const SelectionVector &sel, idx_t count) {
+	throw NotImplementedException("PlainSelect not implemented");
+}
+
 void ColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns, TProtocol &protocol_p) {
-	D_ASSERT(file_idx < columns.size());
-	chunk = &columns[file_idx];
+	D_ASSERT(ColumnIndex() < columns.size());
+	chunk = &columns[ColumnIndex()];
 	protocol = &protocol_p;
 	D_ASSERT(chunk);
 	D_ASSERT(chunk->__isset.meta_data);
@@ -228,15 +204,60 @@ void ColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChun
 	group_rows_available = chunk->meta_data.num_values;
 }
 
-void ColumnReader::PrepareRead() {
+bool ColumnReader::PageIsFilteredOut(PageHeader &page_hdr) {
+	if (!dictionary_decoder.HasFilteredOutAllValues()) {
+		return false;
+	}
+	if (page_hdr.type != PageType::DATA_PAGE && page_hdr.type != PageType::DATA_PAGE_V2) {
+		// we can only filter out data pages
+		return false;
+	}
+	bool is_v1 = page_hdr.type == PageType::DATA_PAGE;
+	auto &v1_header = page_hdr.data_page_header;
+	auto &v2_header = page_hdr.data_page_header_v2;
+	auto page_encoding = is_v1 ? v1_header.encoding : v2_header.encoding;
+	if (page_encoding != Encoding::PLAIN_DICTIONARY && page_encoding != Encoding::RLE_DICTIONARY) {
+		// not a dictionary page
+		return false;
+	}
+	// the page has been filtered out!
+	// skip forward
+	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
+	trans.Skip(page_hdr.compressed_page_size);
+
+	page_rows_available = is_v1 ? v1_header.num_values : v2_header.num_values;
+	encoding = ColumnEncoding::DICTIONARY;
+	page_is_filtered_out = true;
+	return true;
+}
+
+void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_ptr<TableFilterState> filter_state) {
 	encoding = ColumnEncoding::INVALID;
 	defined_decoder.reset();
+	page_is_filtered_out = false;
 	block.reset();
 	PageHeader page_hdr;
-	reader.Read(page_hdr, *protocol);
+	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
+	if (trans.HasPrefetch()) {
+		// Already has some data prefetched, let's not mess with it
+		reader.Read(page_hdr, *protocol);
+	} else {
+		// No prefetch yet, prefetch the full header in one go (so thrift won't read byte-by-byte from storage)
+		// 256 bytes should cover almost all headers (unless it's a V2 header with really LONG string statistics)
+		static constexpr idx_t ASSUMED_HEADER_SIZE = 256;
+		const auto prefetch_size = MinValue(trans.GetSize() - trans.GetLocation(), ASSUMED_HEADER_SIZE);
+		trans.Prefetch(trans.GetLocation(), prefetch_size);
+		reader.Read(page_hdr, *protocol);
+		trans.ClearPrefetch();
+	}
 	// some basic sanity check
 	if (page_hdr.compressed_page_size < 0 || page_hdr.uncompressed_page_size < 0) {
 		throw std::runtime_error("Page sizes can't be < 0");
+	}
+
+	if (PageIsFilteredOut(page_hdr)) {
+		// this page has been filtered out so we don't need to read it
+		return;
 	}
 
 	switch (page_hdr.type) {
@@ -254,7 +275,7 @@ void ColumnReader::PrepareRead() {
 		if (dictionary_size < 0) {
 			throw std::runtime_error("Invalid dictionary page header (num_values < 0)");
 		}
-		dictionary_decoder.InitializeDictionary(dictionary_size);
+		dictionary_decoder.InitializeDictionary(dictionary_size, filter, filter_state, HasDefines());
 		break;
 	}
 	default:
@@ -297,7 +318,8 @@ void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 
 	auto compressed_bytes = page_hdr.compressed_page_size - uncompressed_bytes;
 
-	AllocateCompressed(compressed_bytes);
+	ResizeableBuffer compressed_buffer;
+	compressed_buffer.resize(GetAllocator(), compressed_bytes);
 	reader.ReadData(*protocol, compressed_buffer.ptr, compressed_bytes);
 
 	DecompressInternal(chunk->meta_data.codec, compressed_buffer.ptr, compressed_bytes, block->ptr + uncompressed_bytes,
@@ -312,10 +334,6 @@ void ColumnReader::AllocateBlock(idx_t size) {
 	}
 }
 
-void ColumnReader::AllocateCompressed(idx_t size) {
-	compressed_buffer.resize(GetAllocator(), size);
-}
-
 void ColumnReader::PreparePage(PageHeader &page_hdr) {
 	AllocateBlock(page_hdr.uncompressed_page_size + 1);
 	if (chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
@@ -326,7 +344,8 @@ void ColumnReader::PreparePage(PageHeader &page_hdr) {
 		return;
 	}
 
-	AllocateCompressed(page_hdr.compressed_page_size + 1);
+	ResizeableBuffer compressed_buffer;
+	compressed_buffer.resize(GetAllocator(), page_hdr.compressed_page_size + 1);
 	reader.ReadData(*protocol, compressed_buffer.ptr, page_hdr.compressed_page_size);
 
 	DecompressInternal(chunk->meta_data.codec, compressed_buffer.ptr, page_hdr.compressed_page_size, block->ptr,
@@ -419,7 +438,7 @@ void ColumnReader::PrepareDataPage(PageHeader &page_hdr) {
 	if (HasRepeats()) {
 		uint32_t rep_length = is_v1 ? block->read<uint32_t>() : v2_header.repetition_levels_byte_length;
 		block->available(rep_length);
-		repeated_decoder = make_uniq<RleBpDecoder>(block->ptr, rep_length, RleBpDecoder::ComputeBitWidth(max_repeat));
+		repeated_decoder = make_uniq<RleBpDecoder>(block->ptr, rep_length, RleBpDecoder::ComputeBitWidth(MaxRepeat()));
 		block->inc(rep_length);
 	} else if (is_v2 && v2_header.repetition_levels_byte_length > 0) {
 		block->inc(v2_header.repetition_levels_byte_length);
@@ -428,7 +447,7 @@ void ColumnReader::PrepareDataPage(PageHeader &page_hdr) {
 	if (HasDefines()) {
 		uint32_t def_length = is_v1 ? block->read<uint32_t>() : v2_header.definition_levels_byte_length;
 		block->available(def_length);
-		defined_decoder = make_uniq<RleBpDecoder>(block->ptr, def_length, RleBpDecoder::ComputeBitWidth(max_define));
+		defined_decoder = make_uniq<RleBpDecoder>(block->ptr, def_length, RleBpDecoder::ComputeBitWidth(MaxDefine()));
 		block->inc(def_length);
 	} else if (is_v2 && v2_header.definition_levels_byte_length > 0) {
 		block->inc(v2_header.definition_levels_byte_length);
@@ -476,337 +495,383 @@ void ColumnReader::PrepareDataPage(PageHeader &page_hdr) {
 	}
 }
 
-idx_t ColumnReader::Read(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result) {
+void ColumnReader::BeginRead(data_ptr_t define_out, data_ptr_t repeat_out) {
 	// we need to reset the location because multiple column readers share the same protocol
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
 	trans.SetLocation(chunk_read_offset);
 
 	// Perform any skips that were not applied yet.
-	if (pending_skips > 0) {
-		ApplyPendingSkips(pending_skips, define_out, repeat_out);
+	if (define_out && repeat_out) {
+		ApplyPendingSkips(define_out, repeat_out);
+	}
+}
+
+idx_t ColumnReader::ReadPageHeaders(idx_t max_read, optional_ptr<const TableFilter> filter,
+                                    optional_ptr<TableFilterState> filter_state) {
+	while (page_rows_available == 0) {
+		PrepareRead(filter, filter_state);
+	}
+	return MinValue<idx_t>(MinValue<idx_t>(max_read, page_rows_available), STANDARD_VECTOR_SIZE);
+}
+
+bool ColumnReader::PrepareRead(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, idx_t result_offset) {
+	D_ASSERT(block);
+
+	D_ASSERT(read_now + result_offset <= STANDARD_VECTOR_SIZE);
+	D_ASSERT(!page_is_filtered_out);
+
+	if (HasRepeats()) {
+		D_ASSERT(repeated_decoder);
+		repeated_decoder->GetBatch<uint8_t>(repeat_out + result_offset, read_now);
 	}
 
+	if (HasDefines()) {
+		D_ASSERT(defined_decoder);
+		const auto max_define = NumericCast<uint8_t>(MaxDefine());
+		if (!HasRepeats() && defined_decoder->HasRepeatedBatch<uint8_t>(read_now, max_define)) {
+			// Fast path: no repeats and all valid
+			defined_decoder->GetRepeatedBatch<uint8_t>(read_now, max_define);
+			return true;
+		}
+		defined_decoder->GetBatch<uint8_t>(define_out + result_offset, read_now);
+		return false;
+	}
+
+	return true; // No defines, so everything is valid
+}
+
+void ColumnReader::ReadData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result,
+                            idx_t result_offset) {
+	// flatten the result vector if required
+	if (result_offset != 0 && result.GetVectorType() != VectorType::FLAT_VECTOR) {
+		result.Flatten(result_offset);
+		result.Resize(result_offset, STANDARD_VECTOR_SIZE);
+	}
+	if (page_is_filtered_out) {
+		// page is filtered out - emit NULL for any rows
+		auto &validity = FlatVector::Validity(result);
+		for (idx_t i = 0; i < read_now; i++) {
+			validity.SetInvalid(result_offset + i);
+		}
+		page_rows_available -= read_now;
+		return;
+	}
+	// read the defines/repeats
+	const auto all_valid = PrepareRead(read_now, define_out, repeat_out, result_offset);
+	// read the data according to the encoder
+	const auto define_ptr = all_valid ? nullptr : static_cast<uint8_t *>(define_out);
+	switch (encoding) {
+	case ColumnEncoding::DICTIONARY:
+		dictionary_decoder.Read(define_ptr, read_now, result, result_offset);
+		break;
+	case ColumnEncoding::DELTA_BINARY_PACKED:
+		delta_binary_packed_decoder.Read(define_ptr, read_now, result, result_offset);
+		break;
+	case ColumnEncoding::RLE:
+		rle_decoder.Read(define_ptr, read_now, result, result_offset);
+		break;
+	case ColumnEncoding::DELTA_LENGTH_BYTE_ARRAY:
+		delta_length_byte_array_decoder.Read(block, define_ptr, read_now, result, result_offset);
+		break;
+	case ColumnEncoding::DELTA_BYTE_ARRAY:
+		delta_byte_array_decoder.Read(define_ptr, read_now, result, result_offset);
+		break;
+	case ColumnEncoding::BYTE_STREAM_SPLIT:
+		byte_stream_split_decoder.Read(define_ptr, read_now, result, result_offset);
+		break;
+	default:
+		Plain(block, define_ptr, read_now, result_offset, result);
+		break;
+	}
+	page_rows_available -= read_now;
+}
+
+void ColumnReader::FinishRead(idx_t read_count) {
+	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
+	chunk_read_offset = trans.GetLocation();
+
+	group_rows_available -= read_count;
+}
+
+idx_t ColumnReader::ReadInternal(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result) {
 	idx_t result_offset = 0;
 	auto to_read = num_values;
 	D_ASSERT(to_read <= STANDARD_VECTOR_SIZE);
 
 	while (to_read > 0) {
-		while (page_rows_available == 0) {
-			PrepareRead();
-		}
+		auto read_now = ReadPageHeaders(to_read);
 
-		D_ASSERT(block);
-		auto read_now = MinValue<idx_t>(to_read, page_rows_available);
-
-		D_ASSERT(read_now + result_offset <= STANDARD_VECTOR_SIZE);
-
-		if (HasRepeats()) {
-			D_ASSERT(repeated_decoder);
-			repeated_decoder->GetBatch<uint8_t>(repeat_out + result_offset, read_now);
-		}
-
-		if (HasDefines()) {
-			D_ASSERT(defined_decoder);
-			defined_decoder->GetBatch<uint8_t>(define_out + result_offset, read_now);
-		}
-
-		if (result_offset != 0 && result.GetVectorType() != VectorType::FLAT_VECTOR) {
-			result.Flatten(result_offset);
-			result.Resize(result_offset, STANDARD_VECTOR_SIZE);
-		}
-
-		auto define_ptr = HasDefines() ? static_cast<uint8_t *>(define_out) : nullptr;
-		if (encoding == ColumnEncoding::DICTIONARY) {
-			dictionary_decoder.Read(define_ptr, read_now, result, result_offset);
-		} else if (encoding == ColumnEncoding::DELTA_BINARY_PACKED) {
-			delta_binary_packed_decoder.Read(define_ptr, read_now, result, result_offset);
-		} else if (encoding == ColumnEncoding::RLE) {
-			rle_decoder.Read(define_ptr, read_now, result, result_offset);
-		} else if (encoding == ColumnEncoding::DELTA_LENGTH_BYTE_ARRAY) {
-			delta_length_byte_array_decoder.Read(define_ptr, read_now, result, result_offset);
-		} else if (encoding == ColumnEncoding::DELTA_BYTE_ARRAY) {
-			delta_byte_array_decoder.Read(define_ptr, read_now, result, result_offset);
-		} else if (encoding == ColumnEncoding::BYTE_STREAM_SPLIT) {
-			byte_stream_split_decoder.Read(define_ptr, read_now, result, result_offset);
-		} else {
-			Plain(block, define_out, read_now, result_offset, result);
-		}
+		ReadData(read_now, define_out, repeat_out, result, result_offset);
 
 		result_offset += read_now;
-		page_rows_available -= read_now;
 		to_read -= read_now;
 	}
-	group_rows_available -= num_values;
-	chunk_read_offset = trans.GetLocation();
+	FinishRead(num_values);
 
 	return num_values;
+}
+
+idx_t ColumnReader::Read(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result) {
+	BeginRead(define_out, repeat_out);
+	return ReadInternal(num_values, define_out, repeat_out, result);
+}
+
+void ColumnReader::Select(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result_out,
+                          const SelectionVector &sel, idx_t approved_tuple_count) {
+	if (SupportsDirectSelect() && approved_tuple_count < num_values) {
+		DirectSelect(num_values, define_out, repeat_out, result_out, sel, approved_tuple_count);
+		return;
+	}
+	Read(num_values, define_out, repeat_out, result_out);
+}
+
+void ColumnReader::DirectSelect(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result,
+                                const SelectionVector &sel, idx_t approved_tuple_count) {
+	auto to_read = num_values;
+
+	// prepare the first read if we haven't yet
+	BeginRead(define_out, repeat_out);
+	auto read_now = ReadPageHeaders(num_values);
+
+	// we can only push the filter into the decoder if we are reading the ENTIRE vector in one go
+	if (read_now == to_read && encoding == ColumnEncoding::PLAIN) {
+		const auto all_valid = PrepareRead(read_now, define_out, repeat_out, 0);
+		const auto define_ptr = all_valid ? nullptr : static_cast<uint8_t *>(define_out);
+		PlainSelect(block, define_ptr, read_now, result, sel, approved_tuple_count);
+
+		page_rows_available -= read_now;
+		FinishRead(num_values);
+		return;
+	}
+	// fallback to regular read + filter
+	ReadInternal(num_values, define_out, repeat_out, result);
+}
+
+void ColumnReader::Filter(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result,
+                          const TableFilter &filter, TableFilterState &filter_state, SelectionVector &sel,
+                          idx_t &approved_tuple_count, bool is_first_filter) {
+	if (SupportsDirectFilter() && is_first_filter) {
+		DirectFilter(num_values, define_out, repeat_out, result, filter, filter_state, sel, approved_tuple_count);
+		return;
+	}
+	Select(num_values, define_out, repeat_out, result, sel, approved_tuple_count);
+	ApplyFilter(result, filter, filter_state, num_values, sel, approved_tuple_count);
+}
+
+void ColumnReader::DirectFilter(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result,
+                                const TableFilter &filter, TableFilterState &filter_state, SelectionVector &sel,
+                                idx_t &approved_tuple_count) {
+	auto to_read = num_values;
+
+	// prepare the first read if we haven't yet
+	BeginRead(define_out, repeat_out);
+	auto read_now = ReadPageHeaders(num_values, &filter, &filter_state);
+
+	// we can only push the filter into the decoder if we are reading the ENTIRE vector in one go
+	if (encoding == ColumnEncoding::DICTIONARY && read_now == to_read && dictionary_decoder.HasFilter()) {
+		if (page_is_filtered_out) {
+			// the page has been filtered out entirely - skip
+			approved_tuple_count = 0;
+		} else {
+			// Push filter into dictionary directly
+			// read the defines/repeats
+			const auto all_valid = PrepareRead(read_now, define_out, repeat_out, 0);
+			const auto define_ptr = all_valid ? nullptr : static_cast<uint8_t *>(define_out);
+			dictionary_decoder.Filter(define_ptr, read_now, result, sel, approved_tuple_count);
+		}
+		page_rows_available -= read_now;
+		FinishRead(num_values);
+		return;
+	}
+	// fallback to regular read + filter
+	ReadInternal(num_values, define_out, repeat_out, result);
+	ApplyFilter(result, filter, filter_state, num_values, sel, approved_tuple_count);
+}
+
+void ColumnReader::ApplyFilter(Vector &v, const TableFilter &filter, TableFilterState &filter_state, idx_t scan_count,
+                               SelectionVector &sel, idx_t &approved_tuple_count) {
+	UnifiedVectorFormat vdata;
+	v.ToUnifiedFormat(scan_count, vdata);
+	ColumnSegment::FilterSelection(sel, v, vdata, filter, filter_state, scan_count, approved_tuple_count);
 }
 
 void ColumnReader::Skip(idx_t num_values) {
 	pending_skips += num_values;
 }
 
-void ColumnReader::ApplyPendingSkips(idx_t num_values, data_ptr_t define_out, data_ptr_t repeat_out) {
-	D_ASSERT(num_values >= pending_skips);
-	pending_skips -= num_values;
-
-	// we need to reset the location because multiple column readers share the same protocol
-	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
-	trans.SetLocation(chunk_read_offset);
+void ColumnReader::ApplyPendingSkips(data_ptr_t define_out, data_ptr_t repeat_out) {
+	if (pending_skips == 0) {
+		return;
+	}
+	idx_t num_values = pending_skips;
+	pending_skips = 0;
 
 	auto to_skip = num_values;
+	// start reading but do not apply skips (we are skipping now)
+	BeginRead(nullptr, nullptr);
 
 	while (to_skip > 0) {
-		while (page_rows_available == 0) {
-			PrepareRead();
-		}
+		auto skip_now = ReadPageHeaders(to_skip);
+		const auto all_valid = PrepareRead(skip_now, define_out, repeat_out, 0);
 
-		D_ASSERT(block);
-		auto skip_now = MinValue<idx_t>(MinValue<idx_t>(to_skip, page_rows_available), STANDARD_VECTOR_SIZE);
-
-		// we need to read the repeats/defines even when we are skipping
-		if (HasRepeats()) {
-			D_ASSERT(repeated_decoder);
-			repeated_decoder->GetBatch<uint8_t>(repeat_out, skip_now);
-		}
-
-		if (HasDefines()) {
-			D_ASSERT(defined_decoder);
-			defined_decoder->GetBatch<uint8_t>(define_out, skip_now);
-		}
-
-		auto define_ptr = HasDefines() ? static_cast<uint8_t *>(define_out) : nullptr;
-		if (encoding == ColumnEncoding::DICTIONARY) {
+		const auto define_ptr = all_valid ? nullptr : static_cast<uint8_t *>(define_out);
+		switch (encoding) {
+		case ColumnEncoding::DICTIONARY:
 			dictionary_decoder.Skip(define_ptr, skip_now);
-		} else if (encoding == ColumnEncoding::DELTA_BINARY_PACKED) {
+			break;
+		case ColumnEncoding::DELTA_BINARY_PACKED:
 			delta_binary_packed_decoder.Skip(define_ptr, skip_now);
-		} else if (encoding == ColumnEncoding::RLE) {
+			break;
+		case ColumnEncoding::RLE:
 			rle_decoder.Skip(define_ptr, skip_now);
-		} else if (encoding == ColumnEncoding::DELTA_LENGTH_BYTE_ARRAY) {
+			break;
+		case ColumnEncoding::DELTA_LENGTH_BYTE_ARRAY:
 			delta_length_byte_array_decoder.Skip(define_ptr, skip_now);
-		} else if (encoding == ColumnEncoding::DELTA_BYTE_ARRAY) {
+			break;
+		case ColumnEncoding::DELTA_BYTE_ARRAY:
 			delta_byte_array_decoder.Skip(define_ptr, skip_now);
-		} else if (encoding == ColumnEncoding::BYTE_STREAM_SPLIT) {
+			break;
+		case ColumnEncoding::BYTE_STREAM_SPLIT:
 			byte_stream_split_decoder.Skip(define_ptr, skip_now);
-		} else {
-			PlainSkip(*block, define_out, skip_now);
+			break;
+		default:
+			PlainSkip(*block, define_ptr, skip_now);
+			break;
 		}
-
 		page_rows_available -= skip_now;
 		to_skip -= skip_now;
 	}
-	group_rows_available -= num_values;
-	chunk_read_offset = trans.GetLocation();
+	FinishRead(num_values);
 }
 
 //===--------------------------------------------------------------------===//
 // Create Column Reader
 //===--------------------------------------------------------------------===//
 template <class T>
-unique_ptr<ColumnReader> CreateDecimalReader(ParquetReader &reader, const LogicalType &type_p,
-                                             const SchemaElement &schema_p, idx_t file_idx_p, idx_t max_define,
-                                             idx_t max_repeat) {
-	switch (type_p.InternalType()) {
+unique_ptr<ColumnReader> CreateDecimalReader(ParquetReader &reader, const ParquetColumnSchema &schema) {
+	switch (schema.type.InternalType()) {
 	case PhysicalType::INT16:
-		return make_uniq<TemplatedColumnReader<int16_t, TemplatedParquetValueConversion<T>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<int16_t, TemplatedParquetValueConversion<T>>>(reader, schema);
 	case PhysicalType::INT32:
-		return make_uniq<TemplatedColumnReader<int32_t, TemplatedParquetValueConversion<T>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<int32_t, TemplatedParquetValueConversion<T>>>(reader, schema);
 	case PhysicalType::INT64:
-		return make_uniq<TemplatedColumnReader<int64_t, TemplatedParquetValueConversion<T>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<int64_t, TemplatedParquetValueConversion<T>>>(reader, schema);
 	default:
 		throw NotImplementedException("Unimplemented internal type for CreateDecimalReader");
 	}
 }
 
-unique_ptr<ColumnReader> ColumnReader::CreateReader(ParquetReader &reader, const LogicalType &type_p,
-                                                    const SchemaElement &schema_p, idx_t file_idx_p, idx_t max_define,
-                                                    idx_t max_repeat) {
-	switch (type_p.id()) {
+unique_ptr<ColumnReader> ColumnReader::CreateReader(ParquetReader &reader, const ParquetColumnSchema &schema) {
+	switch (schema.type.id()) {
 	case LogicalTypeId::BOOLEAN:
-		return make_uniq<BooleanColumnReader>(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<BooleanColumnReader>(reader, schema);
 	case LogicalTypeId::UTINYINT:
-		return make_uniq<TemplatedColumnReader<uint8_t, TemplatedParquetValueConversion<uint32_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<uint8_t, TemplatedParquetValueConversion<uint32_t>>>(reader, schema);
 	case LogicalTypeId::USMALLINT:
-		return make_uniq<TemplatedColumnReader<uint16_t, TemplatedParquetValueConversion<uint32_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<uint16_t, TemplatedParquetValueConversion<uint32_t>>>(reader, schema);
 	case LogicalTypeId::UINTEGER:
-		return make_uniq<TemplatedColumnReader<uint32_t, TemplatedParquetValueConversion<uint32_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<uint32_t, TemplatedParquetValueConversion<uint32_t>>>(reader, schema);
 	case LogicalTypeId::UBIGINT:
-		return make_uniq<TemplatedColumnReader<uint64_t, TemplatedParquetValueConversion<uint64_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<uint64_t, TemplatedParquetValueConversion<uint64_t>>>(reader, schema);
 	case LogicalTypeId::TINYINT:
-		return make_uniq<TemplatedColumnReader<int8_t, TemplatedParquetValueConversion<int32_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<int8_t, TemplatedParquetValueConversion<int32_t>>>(reader, schema);
 	case LogicalTypeId::SMALLINT:
-		return make_uniq<TemplatedColumnReader<int16_t, TemplatedParquetValueConversion<int32_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<int16_t, TemplatedParquetValueConversion<int32_t>>>(reader, schema);
 	case LogicalTypeId::INTEGER:
-		return make_uniq<TemplatedColumnReader<int32_t, TemplatedParquetValueConversion<int32_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<int32_t, TemplatedParquetValueConversion<int32_t>>>(reader, schema);
 	case LogicalTypeId::BIGINT:
-		return make_uniq<TemplatedColumnReader<int64_t, TemplatedParquetValueConversion<int64_t>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<TemplatedColumnReader<int64_t, TemplatedParquetValueConversion<int64_t>>>(reader, schema);
 	case LogicalTypeId::FLOAT:
-		return make_uniq<TemplatedColumnReader<float, TemplatedParquetValueConversion<float>>>(
-		    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-	case LogicalTypeId::DOUBLE:
-		switch (schema_p.type) {
-		case Type::BYTE_ARRAY:
-		case Type::FIXED_LEN_BYTE_ARRAY:
-			return ParquetDecimalUtils::CreateReader(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-		default:
-			return make_uniq<TemplatedColumnReader<double, TemplatedParquetValueConversion<double>>>(
-			    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		if (schema.type_info == ParquetExtraTypeInfo::FLOAT16) {
+			return make_uniq<CallbackColumnReader<uint16_t, float, Float16ToFloat32>>(reader, schema);
 		}
+		return make_uniq<TemplatedColumnReader<float, TemplatedParquetValueConversion<float>>>(reader, schema);
+	case LogicalTypeId::DOUBLE:
+		if (schema.type_info == ParquetExtraTypeInfo::DECIMAL_BYTE_ARRAY) {
+			return ParquetDecimalUtils::CreateReader(reader, schema);
+		}
+		return make_uniq<TemplatedColumnReader<double, TemplatedParquetValueConversion<double>>>(reader, schema);
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
-		switch (schema_p.type) {
-		case Type::INT96:
-			return make_uniq<CallbackColumnReader<Int96, timestamp_t, ImpalaTimestampToTimestamp>>(
-			    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-		case Type::INT64:
-			if (schema_p.__isset.logicalType && schema_p.logicalType.__isset.TIMESTAMP) {
-				if (schema_p.logicalType.TIMESTAMP.unit.__isset.MILLIS) {
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampMsToTimestamp>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				} else if (schema_p.logicalType.TIMESTAMP.unit.__isset.MICROS) {
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampMicrosToTimestamp>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				} else if (schema_p.logicalType.TIMESTAMP.unit.__isset.NANOS) {
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampNsToTimestamp>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				}
-			} else if (schema_p.__isset.converted_type) {
-				switch (schema_p.converted_type) {
-				case ConvertedType::TIMESTAMP_MICROS:
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampMicrosToTimestamp>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				case ConvertedType::TIMESTAMP_MILLIS:
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampMsToTimestamp>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				default:
-					break;
-				}
-			}
+		switch (schema.type_info) {
+		case ParquetExtraTypeInfo::IMPALA_TIMESTAMP:
+			return make_uniq<CallbackColumnReader<Int96, timestamp_t, ImpalaTimestampToTimestamp>>(reader, schema);
+		case ParquetExtraTypeInfo::UNIT_MS:
+			return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampMsToTimestamp>>(reader, schema);
+		case ParquetExtraTypeInfo::UNIT_MICROS:
+			return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampMicrosToTimestamp>>(reader,
+			                                                                                                schema);
+		case ParquetExtraTypeInfo::UNIT_NS:
+			return make_uniq<CallbackColumnReader<int64_t, timestamp_t, ParquetTimestampNsToTimestamp>>(reader, schema);
 		default:
-			break;
+			throw InternalException("TIMESTAMP requires type info");
 		}
-		break;
 	case LogicalTypeId::TIMESTAMP_NS:
-		switch (schema_p.type) {
-		case Type::INT96:
-			return make_uniq<CallbackColumnReader<Int96, timestamp_ns_t, ImpalaTimestampToTimestampNS>>(
-			    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-		case Type::INT64:
-			if (schema_p.__isset.logicalType && schema_p.logicalType.__isset.TIMESTAMP) {
-				if (schema_p.logicalType.TIMESTAMP.unit.__isset.MILLIS) {
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampMsToTimestampNs>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				} else if (schema_p.logicalType.TIMESTAMP.unit.__isset.MICROS) {
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampUsToTimestampNs>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				} else if (schema_p.logicalType.TIMESTAMP.unit.__isset.NANOS) {
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampNsToTimestampNs>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				}
-			} else if (schema_p.__isset.converted_type) {
-				switch (schema_p.converted_type) {
-				case ConvertedType::TIMESTAMP_MICROS:
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampUsToTimestampNs>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				case ConvertedType::TIMESTAMP_MILLIS:
-					return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampMsToTimestampNs>>(
-					    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-				default:
-					break;
-				}
-			}
+		switch (schema.type_info) {
+		case ParquetExtraTypeInfo::IMPALA_TIMESTAMP:
+			return make_uniq<CallbackColumnReader<Int96, timestamp_ns_t, ImpalaTimestampToTimestampNS>>(reader, schema);
+		case ParquetExtraTypeInfo::UNIT_MS:
+			return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampMsToTimestampNs>>(reader,
+			                                                                                                 schema);
+		case ParquetExtraTypeInfo::UNIT_MICROS:
+			return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampUsToTimestampNs>>(reader,
+			                                                                                                 schema);
+		case ParquetExtraTypeInfo::UNIT_NS:
+			return make_uniq<CallbackColumnReader<int64_t, timestamp_ns_t, ParquetTimestampNsToTimestampNs>>(reader,
+			                                                                                                 schema);
 		default:
-			break;
+			throw InternalException("TIMESTAMP_NS requires type info");
 		}
-		break;
 	case LogicalTypeId::DATE:
-		return make_uniq<CallbackColumnReader<int32_t, date_t, ParquetIntToDate>>(reader, type_p, schema_p, file_idx_p,
-		                                                                          max_define, max_repeat);
+		return make_uniq<CallbackColumnReader<int32_t, date_t, ParquetIntToDate>>(reader, schema);
 	case LogicalTypeId::TIME:
-		if (schema_p.__isset.logicalType && schema_p.logicalType.__isset.TIME) {
-			if (schema_p.logicalType.TIME.unit.__isset.MILLIS) {
-				return make_uniq<CallbackColumnReader<int32_t, dtime_t, ParquetIntToTimeMs>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			} else if (schema_p.logicalType.TIME.unit.__isset.MICROS) {
-				return make_uniq<CallbackColumnReader<int64_t, dtime_t, ParquetIntToTime>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			} else if (schema_p.logicalType.TIME.unit.__isset.NANOS) {
-				return make_uniq<CallbackColumnReader<int64_t, dtime_t, ParquetIntToTimeNs>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			}
-		} else if (schema_p.__isset.converted_type) {
-			switch (schema_p.converted_type) {
-			case ConvertedType::TIME_MICROS:
-				return make_uniq<CallbackColumnReader<int64_t, dtime_t, ParquetIntToTime>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			case ConvertedType::TIME_MILLIS:
-				return make_uniq<CallbackColumnReader<int32_t, dtime_t, ParquetIntToTimeMs>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			default:
-				break;
-			}
+		switch (schema.type_info) {
+		case ParquetExtraTypeInfo::UNIT_MS:
+			return make_uniq<CallbackColumnReader<int32_t, dtime_t, ParquetIntToTimeMs>>(reader, schema);
+		case ParquetExtraTypeInfo::UNIT_MICROS:
+			return make_uniq<CallbackColumnReader<int64_t, dtime_t, ParquetIntToTime>>(reader, schema);
+		case ParquetExtraTypeInfo::UNIT_NS:
+			return make_uniq<CallbackColumnReader<int64_t, dtime_t, ParquetIntToTimeNs>>(reader, schema);
+		default:
+			throw InternalException("TIME requires type info");
 		}
-		throw NotImplementedException("Unsupported time encoding in Parquet file");
 	case LogicalTypeId::TIME_TZ:
-		if (schema_p.__isset.logicalType && schema_p.logicalType.__isset.TIME) {
-			if (schema_p.logicalType.TIME.unit.__isset.MILLIS) {
-				return make_uniq<CallbackColumnReader<int32_t, dtime_tz_t, ParquetIntToTimeMsTZ>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			} else if (schema_p.logicalType.TIME.unit.__isset.MICROS) {
-				return make_uniq<CallbackColumnReader<int64_t, dtime_tz_t, ParquetIntToTimeTZ>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			} else if (schema_p.logicalType.TIME.unit.__isset.NANOS) {
-				return make_uniq<CallbackColumnReader<int64_t, dtime_tz_t, ParquetIntToTimeNsTZ>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			}
-		} else if (schema_p.__isset.converted_type) {
-			switch (schema_p.converted_type) {
-			case ConvertedType::TIME_MICROS:
-				return make_uniq<CallbackColumnReader<int64_t, dtime_tz_t, ParquetIntToTimeTZ>>(
-				    reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-			default:
-				break;
-			}
+		switch (schema.type_info) {
+		case ParquetExtraTypeInfo::UNIT_MS:
+			return make_uniq<CallbackColumnReader<int32_t, dtime_tz_t, ParquetIntToTimeMsTZ>>(reader, schema);
+		case ParquetExtraTypeInfo::UNIT_MICROS:
+			return make_uniq<CallbackColumnReader<int64_t, dtime_tz_t, ParquetIntToTimeTZ>>(reader, schema);
+		case ParquetExtraTypeInfo::UNIT_NS:
+			return make_uniq<CallbackColumnReader<int64_t, dtime_tz_t, ParquetIntToTimeNsTZ>>(reader, schema);
+		default:
+			throw InternalException("TIME_TZ requires type info");
 		}
-		throw NotImplementedException("Unsupported time encoding in Parquet file");
 	case LogicalTypeId::BLOB:
 	case LogicalTypeId::VARCHAR:
-		return make_uniq<StringColumnReader>(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<StringColumnReader>(reader, schema);
 	case LogicalTypeId::DECIMAL:
 		// we have to figure out what kind of int we need
-		switch (schema_p.type) {
-		case Type::INT32:
-			return CreateDecimalReader<int32_t>(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-		case Type::INT64:
-			return CreateDecimalReader<int64_t>(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
-		case Type::BYTE_ARRAY:
-		case Type::FIXED_LEN_BYTE_ARRAY:
-			return ParquetDecimalUtils::CreateReader(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		switch (schema.type_info) {
+		case ParquetExtraTypeInfo::DECIMAL_INT32:
+			return CreateDecimalReader<int32_t>(reader, schema);
+		case ParquetExtraTypeInfo::DECIMAL_INT64:
+			return CreateDecimalReader<int64_t>(reader, schema);
+		case ParquetExtraTypeInfo::DECIMAL_BYTE_ARRAY:
+			return ParquetDecimalUtils::CreateReader(reader, schema);
 		default:
 			throw NotImplementedException("Unrecognized Parquet type for Decimal");
 		}
 		break;
 	case LogicalTypeId::UUID:
-		return make_uniq<UUIDColumnReader>(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<UUIDColumnReader>(reader, schema);
 	case LogicalTypeId::INTERVAL:
-		return make_uniq<IntervalColumnReader>(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<IntervalColumnReader>(reader, schema);
 	case LogicalTypeId::SQLNULL:
-		return make_uniq<NullColumnReader>(reader, type_p, schema_p, file_idx_p, max_define, max_repeat);
+		return make_uniq<NullColumnReader>(reader, schema);
 	default:
 		break;
 	}
-	throw NotImplementedException(type_p.ToString());
+	throw NotImplementedException(schema.type.ToString());
 }
 
 } // namespace duckdb

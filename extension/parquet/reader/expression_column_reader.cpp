@@ -8,16 +8,19 @@ namespace duckdb {
 //===--------------------------------------------------------------------===//
 ExpressionColumnReader::ExpressionColumnReader(ClientContext &context, unique_ptr<ColumnReader> child_reader_p,
                                                unique_ptr<Expression> expr_p)
-    : ColumnReader(child_reader_p->Reader(), expr_p->return_type, child_reader_p->Schema(), child_reader_p->FileIdx(),
-                   child_reader_p->MaxDefine(), child_reader_p->MaxRepeat()),
-      child_reader(std::move(child_reader_p)), expr(std::move(expr_p)), executor(context, expr.get()) {
+    : ColumnReader(child_reader_p->Reader(), child_reader_p->Schema()), child_reader(std::move(child_reader_p)),
+      expr(std::move(expr_p)), executor(context, expr.get()) {
 	vector<LogicalType> intermediate_types {child_reader->Type()};
 	intermediate_chunk.Initialize(reader.allocator, intermediate_types);
 }
 
-unique_ptr<BaseStatistics> ExpressionColumnReader::Stats(idx_t row_group_idx_p, const vector<ColumnChunk> &columns) {
-	// expression stats is not supported (yet)
-	return nullptr;
+ExpressionColumnReader::ExpressionColumnReader(ClientContext &context, unique_ptr<ColumnReader> child_reader_p,
+                                               unique_ptr<Expression> expr_p,
+                                               unique_ptr<ParquetColumnSchema> expression_schema_p)
+    : ColumnReader(child_reader_p->Reader(), *expression_schema_p), child_reader(std::move(child_reader_p)),
+      expr(std::move(expr_p)), executor(context, expr.get()), expression_schema(std::move(expression_schema_p)) {
+	vector<LogicalType> intermediate_types {child_reader->Type()};
+	intermediate_chunk.Initialize(reader.allocator, intermediate_types);
 }
 
 void ExpressionColumnReader::InitializeRead(idx_t row_group_idx_p, const vector<ColumnChunk> &columns,
